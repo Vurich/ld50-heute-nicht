@@ -4,7 +4,6 @@ use bevy::{
     gltf::GltfPlugin,
     input::{
         keyboard::{KeyCode, KeyboardInput},
-        mouse::MouseMotion,
         ElementState,
     },
     prelude::*,
@@ -238,6 +237,11 @@ struct SceneRoot;
 struct PauseMenu;
 
 #[derive(Component)]
+struct OriginalTransform {
+    transform: Transform,
+}
+
+#[derive(Component)]
 enum ButtonAction {
     GoToState(AppState),
     PopState,
@@ -272,6 +276,7 @@ fn main() {
         .add_system(component_animator_system::<Alive>)
         .add_system(set_grid_attack_colors)
         .add_system(update_grid_elements)
+        .add_system(set_original_transform)
         .add_system(move_camera_based_on_mouse)
         .add_system_set(
             SystemSet::on_enter(AppState::Playing).with_system(start_playing.label("spawn_world")),
@@ -321,6 +326,17 @@ fn main() {
 const NORMAL_BUTTON: Color = Color::rgb(0.15, 0.15, 0.15);
 const HOVERED_BUTTON: Color = Color::rgb(0.25, 0.25, 0.25);
 const PRESSED_BUTTON: Color = Color::rgb(0.55, 0.55, 0.55);
+
+fn set_original_transform(
+    mut commands: Commands,
+    trans: Query<(Entity, &Transform), Without<OriginalTransform>>,
+) {
+    for (e, t) in trans.iter() {
+        commands.entity(e).insert(OriginalTransform {
+            transform: t.clone(),
+        });
+    }
+}
 
 fn pause_timeline(
     mut input_events: ResMut<Events<KeyboardInput>>,
@@ -388,13 +404,25 @@ fn handle_button(
 }
 
 fn move_camera_based_on_mouse(
-    mut mouse: EventReader<MouseMotion>,
-    mut transform: Query<&mut Transform, (With<Camera>, With<PerspectiveProjection>)>,
+    wnds: Res<Windows>,
+    mut transform: Query<
+        (&Camera, &OriginalTransform, &mut Transform),
+        With<PerspectiveProjection>,
+    >,
 ) {
-    for e in mouse.iter() {
-        for mut t in transform.iter_mut() {
-            t.translation.x += e.delta.x * 0.001;
-            t.translation.z += e.delta.y * 0.001;
+    for (camera, original, mut t) in transform.iter_mut() {
+        let wnd = wnds.get(camera.window).unwrap();
+
+        if let Some(screen_pos) = wnd.cursor_position() {
+            let window_size = Vec2::new(wnd.width() as f32, wnd.height() as f32);
+            let ndc = (screen_pos / window_size) * 2.0 - Vec2::ONE;
+
+            let mut new_transform = original.transform.clone();
+
+            new_transform.translation.x += ndc.x * 0.5;
+            new_transform.translation.z -= ndc.y * 0.5;
+
+            *t = new_transform;
         }
     }
 }
