@@ -1,0 +1,14 @@
+[package]
+name = "ld50-heute-nicht"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+bevy = { version = "0.6", features = ["wav"] }
+bevy_kira_audio = { path = "./bevy_kira_audio", features = ["wav", "flac"] }
+bevy_embedded_assets = "0.2"
+bevy_obj = "0.6"
+bevy_tweening = "0.3"

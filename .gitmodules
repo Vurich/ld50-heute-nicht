@@ -1,6 +1,3 @@
-[submodule "bevy_prototype_character_controller"]
-	path = bevy_prototype_character_controller
-	url = https://github.com/superdump/bevy_prototype_character_controller.git
 [submodule "bevy_kira_audio"]
 	path = bevy_kira_audio
 	url = https://github.com/Vurich/bevy_kira_audio.git
