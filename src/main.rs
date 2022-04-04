@@ -1,4 +1,6 @@
 use bevy::{
+    app::{AppExit, Events},
+    ecs::query::{FilterFetch, WorldQuery},
     gltf::GltfPlugin,
     input::{
         keyboard::{KeyCode, KeyboardInput},
@@ -128,13 +130,6 @@ struct PatternStep {
 }
 
 impl PatternStep {
-    const fn nothing() -> Self {
-        Self {
-            mover: None,
-            attack: None,
-        }
-    }
-
     const fn mover(mover: &'static dyn Mover) -> Self {
         Self {
             mover: Some(mover),
@@ -231,25 +226,41 @@ struct GridElement {
 enum AppState {
     Menu,
     Playing,
+    Paused,
     Dead,
 }
 
 #[derive(Component)]
 struct SceneRoot;
 
+#[derive(Component)]
+struct PauseMenu;
+
+#[derive(Component)]
+enum ButtonAction {
+    GoToState(AppState),
+    PopState,
+    Quit,
+}
+
 const DEFAULT_GRID_COLOR: Color = Color::rgb(0.3, 0.3, 0.3);
 const DANGER_GRID_COLOR: Color = Color::rgb(0.87, 0.19, 0.49);
 
+const IS_ON_DESKTOP: bool = !cfg!(target_arch = "wasm32");
+
 fn main() {
-    App::new()
-        .insert_resource(Msaa { samples: 4 })
+    let mut app = App::new();
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_plugins_with(DefaultPlugins, |group| {
+        group.add_before::<bevy::asset::AssetPlugin, _>(bevy_embedded_assets::EmbeddedAssetPlugin)
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_plugins(DefaultPlugins);
+
+    app.insert_resource(Msaa { samples: 4 })
         .insert_resource(ClearColor(Color::BLACK))
         .add_state(AppState::Menu)
-        .add_plugins_with(DefaultPlugins, |group| {
-            group.add_before::<bevy::asset::AssetPlugin, _>(
-                bevy_embedded_assets::EmbeddedAssetPlugin,
-            )
-        })
         .add_plugin(AudioPlugin)
         .add_plugin(GltfPlugin)
         .add_plugin(ObjPlugin)
@@ -263,11 +274,25 @@ fn main() {
         .add_system_set(
             SystemSet::on_enter(AppState::Playing).with_system(start_playing.label("spawn_world")),
         )
-        .add_system_set(SystemSet::on_enter(AppState::Menu).with_system(spawn_menu))
+        .add_system_set(SystemSet::on_enter(AppState::Menu).with_system(spawn_main_menu))
         .add_system_set(SystemSet::on_update(AppState::Menu).with_system(handle_button))
-        .add_system_set(SystemSet::on_exit(AppState::Menu).with_system(clear_stage))
+        .add_system_set(
+            SystemSet::on_exit(AppState::Menu).with_system(clear_stage::<With<SceneRoot>>),
+        )
+        .add_system_set(SystemSet::on_enter(AppState::Paused).with_system(spawn_pause_menu))
+        .add_system_set(
+            SystemSet::on_update(AppState::Paused)
+                .with_system(handle_button)
+                .with_system(pause),
+        )
+        .add_system_set(
+            SystemSet::on_exit(AppState::Paused).with_system(clear_stage::<With<PauseMenu>>),
+        )
+        .add_system_set(SystemSet::on_pause(AppState::Playing).with_system(pause_timeline))
+        .add_system_set(SystemSet::on_resume(AppState::Playing).with_system(resume_timeline))
         .add_system_set(
             SystemSet::on_update(AppState::Playing)
+                .with_system(pause)
                 .with_system(update_attacks)
                 .with_system(enemy_actions)
                 .with_system(control_player)
@@ -284,7 +309,9 @@ fn main() {
                 .after("spawn_world"),
         )
         .add_system_set(SystemSet::on_enter(AppState::Dead).with_system(player_died))
-        .add_system_set(SystemSet::on_exit(AppState::Dead).with_system(clear_stage))
+        .add_system_set(
+            SystemSet::on_exit(AppState::Playing).with_system(clear_stage::<With<SceneRoot>>),
+        )
         .add_startup_system(setup)
         .run();
 }
@@ -293,18 +320,60 @@ const NORMAL_BUTTON: Color = Color::rgb(0.15, 0.15, 0.15);
 const HOVERED_BUTTON: Color = Color::rgb(0.25, 0.25, 0.25);
 const PRESSED_BUTTON: Color = Color::rgb(0.55, 0.55, 0.55);
 
+fn pause_timeline(
+    mut input_events: ResMut<Events<KeyboardInput>>,
+    mut timeline: ResMut<TimelineSettings>,
+) {
+    input_events.clear();
+    timeline.state = TimelineState::Paused;
+}
+
+fn resume_timeline(
+    mut input_events: ResMut<Events<KeyboardInput>>,
+    mut timeline: ResMut<TimelineSettings>,
+) {
+    input_events.clear();
+    timeline.state = TimelineState::Playing;
+}
+
+fn pause(mut state: ResMut<State<AppState>>, mut input: EventReader<KeyboardInput>) {
+    for i in input.iter() {
+        match i {
+            KeyboardInput {
+                key_code: Some(KeyCode::Escape),
+                state: ElementState::Pressed,
+                ..
+            } => {
+                if *state.current() == AppState::Paused {
+                    state.pop().unwrap();
+                } else {
+                    state.push(AppState::Paused).unwrap()
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn handle_button(
     mut interaction_query: Query<
-        (&Interaction, &mut UiColor),
+        (&Interaction, &ButtonAction, &mut UiColor),
         (Changed<Interaction>, With<Button>),
     >,
     mut app_state: ResMut<State<AppState>>,
+    mut exit: EventWriter<AppExit>,
 ) {
-    for (interaction, mut color) in interaction_query.iter_mut() {
+    for (interaction, action, mut color) in interaction_query.iter_mut() {
         match *interaction {
             Interaction::Clicked => {
                 *color = PRESSED_BUTTON.into();
-                app_state.set(AppState::Playing).unwrap();
+                match action {
+                    ButtonAction::GoToState(state) => {
+                        app_state.overwrite_replace(state.clone()).unwrap()
+                    }
+                    ButtonAction::PopState => app_state.pop().unwrap(),
+                    ButtonAction::Quit => exit.send(AppExit),
+                }
             }
             Interaction::Hovered => {
                 *color = HOVERED_BUTTON.into();
@@ -316,7 +385,7 @@ fn handle_button(
     }
 }
 
-fn spawn_menu(
+fn spawn_main_menu(
     mut commands: Commands,
     mut scene_spawner: ResMut<SceneSpawner>,
     asset_server: Res<AssetServer>,
@@ -348,6 +417,7 @@ fn spawn_menu(
                     color: NORMAL_BUTTON.into(),
                     ..Default::default()
                 })
+                .insert(ButtonAction::GoToState(AppState::Playing))
                 .with_children(|parent| {
                     parent.spawn_bundle(TextBundle {
                         text: Text::with_section(
@@ -362,6 +432,39 @@ fn spawn_menu(
                         ..Default::default()
                     });
                 });
+
+            if IS_ON_DESKTOP {
+                commands
+                    .spawn_bundle(ButtonBundle {
+                        style: Style {
+                            size: Size::new(Val::Px(300.0), Val::Px(70.0)),
+                            // center button
+                            margin: Rect::all(Val::Auto),
+                            // horizontally center child text
+                            justify_content: JustifyContent::Center,
+                            // vertically center child text
+                            align_items: AlignItems::Center,
+                            ..Default::default()
+                        },
+                        color: NORMAL_BUTTON.into(),
+                        ..Default::default()
+                    })
+                    .insert(ButtonAction::Quit)
+                    .with_children(|parent| {
+                        parent.spawn_bundle(TextBundle {
+                            text: Text::with_section(
+                                "NOT TONIGHT",
+                                TextStyle {
+                                    font: asset_server.load("fonts/Gamer.ttf"),
+                                    font_size: 40.0,
+                                    color: Color::rgb(0.9, 0.3, 0.3),
+                                },
+                                Default::default(),
+                            ),
+                            ..Default::default()
+                        });
+                    });
+            }
         });
 
     let root_3d = commands
@@ -369,7 +472,122 @@ fn spawn_menu(
         .insert(SceneRoot)
         .insert(Children::default())
         .id();
-    scene_spawner.spawn_as_child(asset_server.load("berghain.glb#Scene0"), root_3d);
+    scene_spawner.spawn_as_child(asset_server.load("menu.glb#Scene0"), root_3d);
+}
+
+fn spawn_pause_menu(
+    mut commands: Commands,
+    mut timeline: ResMut<TimelineSettings>,
+    asset_server: Res<AssetServer>,
+) {
+    timeline.state = TimelineState::Paused;
+
+    commands
+        .spawn_bundle(NodeBundle {
+            style: Style {
+                size: Size::new(Val::Percent(100.0), Val::Percent(100.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                ..Default::default()
+            },
+            color: Color::NONE.into(),
+            ..Default::default()
+        })
+        .insert(PauseMenu)
+        .with_children(|commands| {
+            commands
+                .spawn_bundle(ButtonBundle {
+                    style: Style {
+                        size: Size::new(Val::Px(300.0), Val::Px(70.0)),
+                        // center button
+                        margin: Rect::all(Val::Auto),
+                        // horizontally center child text
+                        justify_content: JustifyContent::Center,
+                        // vertically center child text
+                        align_items: AlignItems::Center,
+                        ..Default::default()
+                    },
+                    color: NORMAL_BUTTON.into(),
+                    ..Default::default()
+                })
+                .insert(ButtonAction::PopState)
+                .with_children(|parent| {
+                    parent.spawn_bundle(TextBundle {
+                        text: Text::with_section(
+                            "KEEP GOING",
+                            TextStyle {
+                                font: asset_server.load("fonts/Gamer.ttf"),
+                                font_size: 40.0,
+                                color: Color::rgb(0.9, 0.9, 0.9),
+                            },
+                            Default::default(),
+                        ),
+                        ..Default::default()
+                    });
+                });
+            commands
+                .spawn_bundle(ButtonBundle {
+                    style: Style {
+                        size: Size::new(Val::Px(300.0), Val::Px(70.0)),
+                        // center button
+                        margin: Rect::all(Val::Auto),
+                        // horizontally center child text
+                        justify_content: JustifyContent::Center,
+                        // vertically center child text
+                        align_items: AlignItems::Center,
+                        ..Default::default()
+                    },
+                    color: NORMAL_BUTTON.into(),
+                    ..Default::default()
+                })
+                .insert(ButtonAction::GoToState(AppState::Menu))
+                .with_children(|parent| {
+                    parent.spawn_bundle(TextBundle {
+                        text: Text::with_section(
+                            "BACK OUTSIDE",
+                            TextStyle {
+                                font: asset_server.load("fonts/Gamer.ttf"),
+                                font_size: 40.0,
+                                color: Color::rgb(0.9, 0.9, 0.9),
+                            },
+                            Default::default(),
+                        ),
+                        ..Default::default()
+                    });
+                });
+
+            if IS_ON_DESKTOP {
+                commands
+                    .spawn_bundle(ButtonBundle {
+                        style: Style {
+                            size: Size::new(Val::Px(300.0), Val::Px(70.0)),
+                            // center button
+                            margin: Rect::all(Val::Auto),
+                            // horizontally center child text
+                            justify_content: JustifyContent::Center,
+                            // vertically center child text
+                            align_items: AlignItems::Center,
+                            ..Default::default()
+                        },
+                        color: NORMAL_BUTTON.into(),
+                        ..Default::default()
+                    })
+                    .insert(ButtonAction::Quit)
+                    .with_children(|parent| {
+                        parent.spawn_bundle(TextBundle {
+                            text: Text::with_section(
+                                "TIME TO GO HOME",
+                                TextStyle {
+                                    font: asset_server.load("fonts/Gamer.ttf"),
+                                    font_size: 40.0,
+                                    color: Color::rgb(0.9, 0.4, 0.4),
+                                },
+                                Default::default(),
+                            ),
+                            ..Default::default()
+                        });
+                    });
+            }
+        });
 }
 
 fn do_damage(
@@ -392,22 +610,29 @@ fn do_damage(
     }
 }
 
-fn check_for_player_death(mut app_state: ResMut<State<AppState>>, players: Query<&IsPlayer>) {
+fn check_for_player_death(
+    mut app_state: ResMut<State<AppState>>,
+    players: Query<(), With<IsPlayer>>,
+) {
     if players.is_empty() {
-        app_state.set(AppState::Dead).unwrap();
+        app_state.push(AppState::Dead).unwrap();
     }
 }
+
 #[derive(Component)]
 struct DeathText;
 
 fn player_died(
     mut commands: Commands,
-    attacks: Query<(Entity, &AttackComponent)>,
+    attacks: Query<Entity, With<AttackComponent>>,
+    mut timeline: ResMut<bevy_kira_audio::TimelineSettings>,
     asset_server: Res<AssetServer>,
 ) {
-    for (e, _) in attacks.iter() {
+    for e in attacks.iter() {
         commands.entity(e).despawn();
     }
+
+    timeline.state = bevy_kira_audio::TimelineState::Stopped;
 
     commands
         .spawn_bundle(NodeBundle {
@@ -565,11 +790,11 @@ fn play_four_to_the_floor(
     asset_server: Res<AssetServer>,
     audio: Res<Audio>,
     mut events: EventReader<BeatEvent>,
-    mut elements: Query<(Entity, &Handle<StandardMaterial>, &GridElement)>,
+    mut elements: Query<Entity, (With<Handle<StandardMaterial>>, With<GridElement>)>,
 ) {
     if events.iter().any(|&beat| beat == BeatEvent::Quarter) {
         audio.play(asset_server.load("kick-hit.wav"));
-        for (e, _, _) in elements.iter_mut() {
+        for e in elements.iter_mut() {
             commands
                 .entity(e)
                 .insert(Animator::new(Tween::<GridElement>::new(
@@ -603,14 +828,14 @@ fn set_grid_transform(
 fn back_to_menu(mut input: EventReader<KeyboardInput>, mut state: ResMut<State<AppState>>) {
     for i in input.iter() {
         if i.state == ElementState::Pressed {
-            state.set(AppState::Menu).unwrap();
+            state.replace(AppState::Menu).unwrap();
         }
     }
 }
 
 fn control_player(
     mut input: EventReader<KeyboardInput>,
-    mut objs: Query<(&mut GridMovement, &IsPlayer)>,
+    mut objs: Query<&mut GridMovement, With<IsPlayer>>,
 ) {
     for i in input.iter() {
         let dir = match i {
@@ -637,7 +862,7 @@ fn control_player(
             _ => continue,
         };
 
-        for (mut mvmt, _) in objs.iter_mut() {
+        for mut mvmt in objs.iter_mut() {
             mvmt.x = dir.0;
             mvmt.y = dir.1;
         }
@@ -1002,10 +1227,13 @@ fn update_grid_elements(
 fn start_playing(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut timeline: ResMut<bevy_kira_audio::TimelineSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
     asset_server: Res<AssetServer>,
     mut scene_spawner: ResMut<SceneSpawner>,
 ) {
+    timeline.state = bevy_kira_audio::TimelineState::Playing;
+
     let root = commands
         .spawn()
         .insert_bundle(PbrBundle::default())
@@ -1142,8 +1370,11 @@ fn start_playing(
     }
 }
 
-fn clear_stage(mut commands: Commands, roots: Query<(Entity, &SceneRoot)>) {
-    for (root, _) in roots.iter() {
+fn clear_stage<Filter: WorldQuery>(mut commands: Commands, roots: Query<Entity, Filter>)
+where
+    Filter::Fetch: FilterFetch,
+{
+    for root in roots.iter() {
         commands.entity(root.clone()).despawn_recursive();
     }
 }
@@ -1159,5 +1390,4 @@ fn setup(
     ambient_light.brightness = 0.5;
 
     timeline.bpm = DEFAULT_BPM as _;
-    timeline.state = TimelineState::Playing;
 }
