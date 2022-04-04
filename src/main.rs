@@ -414,15 +414,16 @@ fn move_camera_based_on_mouse(
         let wnd = wnds.get(camera.window).unwrap();
 
         if let Some(screen_pos) = wnd.cursor_position() {
-            const FACTOR: f32 = 0.3;
+            const FACTOR: f32 = 0.02;
+            const MOVE_AMT: f32 = 1.2;
 
             let window_size = Vec2::new(wnd.width() as f32, wnd.height() as f32);
             let ndc = (screen_pos / window_size) * 2.0 - Vec2::ONE;
 
             let mut new_translate = original.transform.translation;
 
-            new_translate.x += ndc.x * 0.5;
-            new_translate.z -= ndc.y * 0.5;
+            new_translate.x += ndc.x * MOVE_AMT;
+            new_translate.z -= ndc.y * MOVE_AMT;
 
             t.translation = t.translation + (new_translate - t.translation) * FACTOR;
         }
