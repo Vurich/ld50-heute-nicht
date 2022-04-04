@@ -4,6 +4,7 @@ use bevy::{
     gltf::GltfPlugin,
     input::{
         keyboard::{KeyCode, KeyboardInput},
+        mouse::MouseMotion,
         ElementState,
     },
     prelude::*,
@@ -271,6 +272,7 @@ fn main() {
         .add_system(component_animator_system::<Alive>)
         .add_system(set_grid_attack_colors)
         .add_system(update_grid_elements)
+        .add_system(move_camera_based_on_mouse)
         .add_system_set(
             SystemSet::on_enter(AppState::Playing).with_system(start_playing.label("spawn_world")),
         )
@@ -381,6 +383,18 @@ fn handle_button(
             Interaction::None => {
                 *color = NORMAL_BUTTON.into();
             }
+        }
+    }
+}
+
+fn move_camera_based_on_mouse(
+    mut mouse: EventReader<MouseMotion>,
+    mut transform: Query<&mut Transform, (With<Camera>, With<PerspectiveProjection>)>,
+) {
+    for e in mouse.iter() {
+        for mut t in transform.iter_mut() {
+            t.translation.x += e.delta.x * 0.001;
+            t.translation.z += e.delta.y * 0.001;
         }
     }
 }
