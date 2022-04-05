@@ -11,6 +11,8 @@ bevy = { version = "0.6", features = ["wav"] }
 bevy_kira_audio = { path = "./bevy_kira_audio", features = ["wav", "flac"] }
 bevy_obj = "0.6"
 bevy_tweening = "0.3"
+rand = "0.8"
 
 [target."wasm32-unknown-unknown".dependencies]
 bevy_embedded_assets = "0.2"
+bevy-web-resizer = "1.0"

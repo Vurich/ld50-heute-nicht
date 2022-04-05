@@ -7,6 +7,7 @@ use bevy::{
         ElementState,
     },
     prelude::*,
+    reflect::TypeUuid,
     ui::UiPlugin,
 };
 use bevy_kira_audio::{
@@ -130,6 +131,12 @@ struct PatternStep {
 }
 
 impl PatternStep {
+    const fn nothing() -> Self {
+        Self {
+            mover: None,
+            attack: None,
+        }
+    }
     const fn mover(mover: &'static dyn Mover) -> Self {
         Self {
             mover: Some(mover),
@@ -215,7 +222,7 @@ impl Grid {
     }
 }
 
-const DEFAULT_BPM: u8 = 147;
+const DEFAULT_BPM: u8 = 130;
 
 #[derive(Component)]
 struct GridElement {
@@ -248,23 +255,43 @@ enum ButtonAction {
     Quit,
 }
 
+#[derive(Component)]
+struct HealthPickup;
+
 const DEFAULT_GRID_COLOR: Color = Color::rgb(0.3, 0.3, 0.3);
 const DANGER_GRID_COLOR: Color = Color::rgb(0.87, 0.19, 0.49);
 
 const IS_ON_DESKTOP: bool = !cfg!(target_arch = "wasm32");
 
+#[derive(TypeUuid, Default, Debug, PartialEq, Eq)]
+#[uuid = "50c5f8a0-5697-4fa6-8b22-42aad9d39d4f"]
+struct BeatNumber {
+    n: usize,
+    hit: bool,
+}
+
 fn main() {
     let mut app = App::new();
+    app.insert_resource(WindowDescriptor {
+        title: "Heute Nicht".to_string(),
+        vsync: true,
+        resizable: true,
+        #[cfg(target_arch = "wasm32")]
+        mode: bevy::window::WindowMode::BorderlessFullscreen,
+        ..Default::default()
+    });
 
     #[cfg(target_arch = "wasm32")]
     app.add_plugins_with(DefaultPlugins, |group| {
         group.add_before::<bevy::asset::AssetPlugin, _>(bevy_embedded_assets::EmbeddedAssetPlugin)
-    });
+    })
+    .add_plugin(bevy_web_resizer::Plugin);
     #[cfg(not(target_arch = "wasm32"))]
     app.add_plugins(DefaultPlugins);
 
     app.insert_resource(Msaa { samples: 4 })
         .insert_resource(ClearColor(Color::BLACK))
+        .init_resource::<BeatNumber>()
         .add_state(AppState::Menu)
         .add_plugin(AudioPlugin)
         .add_plugin(GltfPlugin)
@@ -301,11 +328,15 @@ fn main() {
             SystemSet::on_update(AppState::Playing)
                 .with_system(pause)
                 .with_system(update_attacks)
+                .with_system(update_health_text)
                 .with_system(enemy_actions)
                 .with_system(control_player)
                 .with_system(move_on_grid)
-                .with_system(do_damage)
+                .with_system(give_health.label("add_health"))
+                .with_system(do_damage.after("add_health"))
                 .with_system(play_four_to_the_floor)
+                .with_system(spawn_enemies)
+                .with_system(spawn_health)
                 .with_system(set_grid_transform)
                 .with_system(check_for_player_death)
                 .after("spawn_world"),
@@ -530,6 +561,7 @@ fn spawn_pause_menu(
     commands
         .spawn_bundle(NodeBundle {
             style: Style {
+                position_type: PositionType::Absolute,
                 size: Size::new(Val::Percent(100.0), Val::Percent(100.0)),
                 justify_content: JustifyContent::SpaceBetween,
                 ..Default::default()
@@ -635,19 +667,202 @@ fn spawn_pause_menu(
         });
 }
 
+fn spawn_health(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cur_beat: Res<BeatNumber>,
+    grid: Query<(Entity, &Grid)>,
+) {
+    if !cur_beat.hit {
+        return;
+    }
+
+    let grid = grid.single();
+
+    let give_health = match cur_beat.n {
+        33..=256 => (cur_beat.n - 33) % 64 == 0,
+        257..=1024 => (cur_beat.n - 257) % 128 == 0,
+        1025..=4096 => (cur_beat.n - 1025) % 256 == 0,
+        _ => false,
+    };
+
+    if give_health {
+        use rand::prelude::*;
+
+        let mut random = thread_rng();
+
+        let pos = loop {
+            let pos = GridPosition {
+                x: random.gen(),
+                y: random.gen(),
+            };
+
+            if grid.1.at(pos) == Collision::NonSolid {
+                break pos;
+            }
+        };
+
+        commands
+            .spawn_bundle(PbrBundle {
+                mesh: asset_server.load("clubmate.obj"),
+                material: materials.add(StandardMaterial {
+                    base_color_texture: Some(asset_server.load("clubmate.png")),
+                    perceptual_roughness: 0.2,
+                    ..Default::default()
+                }),
+                transform: Transform::identity().with_scale(Vec3::splat(2.)),
+                ..Default::default()
+            })
+            .insert(pos)
+            .insert(Parent(grid.0))
+            .insert(HealthPickup);
+    }
+}
+
+fn spawn_enemies(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cur_beat: Res<BeatNumber>,
+    grid: Query<Entity, With<Grid>>,
+    player: Query<Entity, With<IsPlayer>>,
+) {
+    const NUM_HATS_PER_WAVE: usize = 4;
+    const HATS_FIRST_WAVE: usize = 65;
+    const HATS_SECOND_WAVE: usize = 513;
+    const HATS_THIRD_WAVE: usize = 1025;
+    const HATS_WAVE_PERIOD: usize = 32;
+
+    if !cur_beat.hit {
+        return;
+    }
+
+    let grid = grid.single();
+    let player = player.iter().next();
+
+    let mut enemy = match cur_beat.n {
+        9 => {
+            let snare = spawn_snare(
+                &mut commands,
+                &mut *materials,
+                &*asset_server,
+                1,
+                GridMovement { x: 0, y: -1 },
+            );
+            let mut snare = commands.entity(snare);
+            snare.insert(GridPosition { x: 5, y: 10 });
+            snare
+        }
+        257 => {
+            let snare = spawn_snare(
+                &mut commands,
+                &mut *materials,
+                &*asset_server,
+                3,
+                GridMovement { x: 0, y: 1 },
+            );
+
+            let mut snare = commands.entity(snare);
+            snare.insert(GridPosition { x: 10, y: 5 });
+            snare
+        }
+        i if (HATS_FIRST_WAVE..HATS_FIRST_WAVE + NUM_HATS_PER_WAVE * HATS_WAVE_PERIOD)
+            .contains(&i)
+            && (i - HATS_FIRST_WAVE) % HATS_WAVE_PERIOD == 0 =>
+        {
+            let i = (i - HATS_FIRST_WAVE) / HATS_WAVE_PERIOD;
+            let hat = spawn_hat(&mut commands, &mut *materials, &*asset_server, i * 4 + 1);
+            let mut hat = commands.entity(hat);
+            hat.insert(GridPosition {
+                x: 2 + (i as u8 * 4),
+                y: 1 + (i as u8 * 3),
+            });
+            hat
+        }
+        i if (HATS_SECOND_WAVE..HATS_SECOND_WAVE + NUM_HATS_PER_WAVE * HATS_WAVE_PERIOD)
+            .contains(&i)
+            && (i - HATS_SECOND_WAVE) % HATS_WAVE_PERIOD == 0 =>
+        {
+            let i = (i - HATS_SECOND_WAVE) / HATS_WAVE_PERIOD;
+            let hat = spawn_hat(&mut commands, &mut *materials, &*asset_server, i * 4 + 3);
+            let mut hat = commands.entity(hat);
+            hat.insert(GridPosition {
+                x: 1 + (i as u8 * 3),
+                y: 2 + (i as u8 * 4),
+            });
+            hat
+        }
+        i if (HATS_THIRD_WAVE..HATS_THIRD_WAVE + NUM_HATS_PER_WAVE * HATS_WAVE_PERIOD)
+            .contains(&i)
+            && (i - HATS_THIRD_WAVE) % HATS_WAVE_PERIOD == 0 =>
+        {
+            let i = (i - HATS_THIRD_WAVE) / HATS_WAVE_PERIOD;
+            let hat = spawn_hat(&mut commands, &mut *materials, &*asset_server, i * 2 + 2);
+            let mut hat = commands.entity(hat);
+            hat.insert(GridPosition {
+                x: 1 + (i as u8 * 3),
+                y: 2 + (i as u8 * 4),
+            });
+            hat
+        }
+        _ => return,
+    };
+
+    if let Some(p) = player {
+        enemy.insert(Target(p));
+    }
+    enemy.insert(Parent(grid.clone()));
+}
+
+fn give_health(
+    mut commands: Commands,
+    audio: Res<Audio>,
+    asset_server: Res<AssetServer>,
+    mut health_pickups: Query<(Entity, &GridPosition), With<HealthPickup>>,
+    mut players: Query<(&mut Health, &GridPosition), With<IsPlayer>>,
+) {
+    for pickup in health_pickups.iter_mut() {
+        for mut player in players.iter_mut() {
+            if pickup.1 == player.1 {
+                audio.play(asset_server.load("health.wav"));
+                commands.entity(pickup.0).despawn_recursive();
+                player.0.amount += 1;
+            }
+        }
+    }
+}
+
 fn do_damage(
     mut attacks: Query<&mut AttackComponent>,
+    audio: Res<Audio>,
+    asset_server: Res<AssetServer>,
     attackers: Query<&Team>,
-    mut entities: Query<(Entity, &GridPosition, &mut Health, &mut Alive, &Team)>,
+    mut entities: Query<(
+        Entity,
+        &GridPosition,
+        &mut Health,
+        &mut Alive,
+        &Team,
+        Option<&IsPlayer>,
+    )>,
 ) {
     for mut atk in attacks.iter_mut() {
         let attacker_team = attackers.get(atk.owner).unwrap();
-        for (e, pos, mut health, mut alive, team) in entities.iter_mut() {
+        for (e, pos, mut health, mut alive, team, is_player) in entities.iter_mut() {
             if *team != *attacker_team && atk.already_hit.insert(e) {
                 if let Some(atk_data) = atk.attack.hit(pos) {
                     health.amount = health.amount.saturating_sub(atk_data.damage);
                     if health.amount == 0 {
                         alive.alive = false;
+                    }
+
+                    if is_player.is_some() {
+                        if health.amount == 0 {
+                            audio.play(asset_server.load("dead.wav"));
+                        } else {
+                            audio.play(asset_server.load("hurt.wav"));
+                        }
                     }
                 }
             }
@@ -663,9 +878,6 @@ fn check_for_player_death(
         app_state.push(AppState::Dead).unwrap();
     }
 }
-
-#[derive(Component)]
-struct DeathText;
 
 fn player_died(
     mut commands: Commands,
@@ -691,66 +903,62 @@ fn player_died(
         })
         .insert(SceneRoot)
         .with_children(|commands| {
-            commands
-                .spawn_bundle(TextBundle {
-                    style: Style {
-                        align_self: AlignSelf::FlexEnd,
-                        position_type: PositionType::Absolute,
-                        position: Rect {
-                            bottom: Val::Px(60.0),
-                            right: Val::Px(20.0),
-                            ..Default::default()
-                        },
+            commands.spawn_bundle(TextBundle {
+                style: Style {
+                    align_self: AlignSelf::FlexEnd,
+                    position_type: PositionType::Absolute,
+                    position: Rect {
+                        bottom: Val::Px(60.0),
+                        right: Val::Px(20.0),
                         ..Default::default()
                     },
-                    // Use the `Text::with_section` constructor
-                    text: Text::with_section(
-                        // Accepts a `String` or any type that converts into a `String`, such as `&str`
-                        "The beats are over",
-                        TextStyle {
-                            font: asset_server.load("fonts/edunline.ttf"),
-                            font_size: 100.0,
-                            color: Color::WHITE,
-                        },
-                        // Note: You can use `Default::default()` in place of the `TextAlignment`
-                        TextAlignment {
-                            horizontal: HorizontalAlign::Center,
-                            ..Default::default()
-                        },
-                    ),
                     ..Default::default()
-                })
-                .insert(DeathText);
-            commands
-                .spawn_bundle(TextBundle {
-                    style: Style {
-                        align_self: AlignSelf::FlexEnd,
-                        position_type: PositionType::Absolute,
-                        position: Rect {
-                            bottom: Val::Px(30.0),
-                            right: Val::Px(20.0),
-                            ..Default::default()
-                        },
+                },
+                // Use the `Text::with_section` constructor
+                text: Text::with_section(
+                    // Accepts a `String` or any type that converts into a `String`, such as `&str`
+                    "The beats are over",
+                    TextStyle {
+                        font: asset_server.load("fonts/edunline.ttf"),
+                        font_size: 100.0,
+                        color: Color::WHITE,
+                    },
+                    // Note: You can use `Default::default()` in place of the `TextAlignment`
+                    TextAlignment {
+                        horizontal: HorizontalAlign::Center,
                         ..Default::default()
                     },
-                    // Use the `Text::with_section` constructor
-                    text: Text::with_section(
-                        // Accepts a `String` or any type that converts into a `String`, such as `&str`
-                        "Press any key to return to the menu",
-                        TextStyle {
-                            font: asset_server.load("fonts/Gamer.ttf"),
-                            font_size: 30.0,
-                            color: Color::WHITE,
-                        },
-                        // Note: You can use `Default::default()` in place of the `TextAlignment`
-                        TextAlignment {
-                            horizontal: HorizontalAlign::Center,
-                            ..Default::default()
-                        },
-                    ),
+                ),
+                ..Default::default()
+            });
+            commands.spawn_bundle(TextBundle {
+                style: Style {
+                    align_self: AlignSelf::FlexEnd,
+                    position_type: PositionType::Absolute,
+                    position: Rect {
+                        bottom: Val::Px(30.0),
+                        right: Val::Px(20.0),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                })
-                .insert(DeathText);
+                },
+                // Use the `Text::with_section` constructor
+                text: Text::with_section(
+                    // Accepts a `String` or any type that converts into a `String`, such as `&str`
+                    "Press escape to return to the menu",
+                    TextStyle {
+                        font: asset_server.load("fonts/Gamer.ttf"),
+                        font_size: 30.0,
+                        color: Color::WHITE,
+                    },
+                    // Note: You can use `Default::default()` in place of the `TextAlignment`
+                    TextAlignment {
+                        horizontal: HorizontalAlign::Center,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            });
         });
 }
 
@@ -834,10 +1042,15 @@ fn play_four_to_the_floor(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     audio: Res<Audio>,
+    mut cur_beat: ResMut<BeatNumber>,
     mut events: EventReader<BeatEvent>,
     mut elements: Query<Entity, (With<Handle<StandardMaterial>>, With<GridElement>)>,
 ) {
+    cur_beat.hit = false;
     if events.iter().any(|&beat| beat == BeatEvent::Quarter) {
+        cur_beat.n = cur_beat.n.saturating_add(1);
+        cur_beat.hit = true;
+
         audio.play(asset_server.load("kick-hit.wav"));
         for e in elements.iter_mut() {
             commands
@@ -872,7 +1085,7 @@ fn set_grid_transform(
 
 fn back_to_menu(mut input: EventReader<KeyboardInput>, mut state: ResMut<State<AppState>>) {
     for i in input.iter() {
-        if i.state == ElementState::Pressed {
+        if i.state == ElementState::Pressed && i.key_code == Some(KeyCode::Escape) {
             state.replace(AppState::Menu).unwrap();
         }
     }
@@ -982,7 +1195,8 @@ fn spawn_hat(
     const MAX_DIST: u8 = 2;
 
     struct MakeHatAttack;
-    struct HatMover;
+    struct HatDefaultMover;
+    struct HatTowardsTargetMover;
 
     struct HatAttack {
         pos: GridPosition,
@@ -993,7 +1207,7 @@ fn spawn_hat(
         desired_dir: GridMovement,
     }
 
-    impl Mover for HatMover {
+    impl Mover for HatDefaultMover {
         fn choose_move(
             &self,
             state: &mut dyn Any,
@@ -1011,9 +1225,53 @@ fn spawn_hat(
         }
     }
 
+    impl Mover for HatTowardsTargetMover {
+        fn choose_move(
+            &self,
+            state: &mut dyn Any,
+            target: Option<&GridPosition>,
+            _grid: &Grid,
+            pos: &GridPosition,
+        ) -> Option<GridMovement> {
+            let state: &HatMoveState = state.downcast_ref().unwrap();
+
+            if let Some(target) = target {
+                if state.desired_dir.x == 0 {
+                    if target.x < pos.x {
+                        Some(GridMovement { x: -1, y: 0 })
+                    } else if target.x > pos.x {
+                        Some(GridMovement { x: 1, y: 0 })
+                    } else {
+                        None
+                    }
+                } else {
+                    if target.y < pos.y {
+                        Some(GridMovement { x: 0, y: -1 })
+                    } else if target.y > pos.y {
+                        Some(GridMovement { x: 0, y: 1 })
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    }
+
     impl Attack for HatAttack {
         fn hit(&self, pos: &GridPosition) -> Option<AttackData> {
-            if ((Some(pos.x) == self.pos.x.checked_sub(self.dist)
+            if self.dist == MAX_DIST {
+                if (pos.x == self.pos.x.saturating_sub(self.dist)
+                    || pos.x == self.pos.x.saturating_add(self.dist))
+                    && (pos.y == self.pos.y.saturating_sub(self.dist)
+                        || pos.y == self.pos.y.saturating_add(self.dist))
+                {
+                    Some(AttackData { damage: 1 })
+                } else {
+                    None
+                }
+            } else if ((Some(pos.x) == self.pos.x.checked_sub(self.dist)
                 || pos.x == self.pos.x + self.dist)
                 && (self.pos.y.saturating_sub(self.dist)..=self.pos.y + self.dist).contains(&pos.y))
                 || ((Some(pos.y) == self.pos.y.checked_sub(self.dist)
@@ -1029,13 +1287,16 @@ fn spawn_hat(
 
         fn update(&mut self, beat: &BeatEvent) -> bool {
             match beat {
-                BeatEvent::EighthTriplet => {
-                    self.dist += 1;
+                BeatEvent::QuarterTriplet => {
+                    if self.dist == MAX_DIST {
+                        false
+                    } else {
+                        self.dist += 1;
+                        true
+                    }
                 }
-                _ => {}
+                _ => true,
             }
-
-            self.dist <= MAX_DIST
         }
     }
 
@@ -1050,33 +1311,44 @@ fn spawn_hat(
             AttackComponent {
                 owner,
                 already_hit: Default::default(),
-                attack: Box::new(HatAttack { pos: *pos, dist: 1 }),
+                attack: Box::new(HatAttack { pos: *pos, dist: 0 }),
             }
         }
     }
 
     const MAKE_ATTACK: &dyn MakeAttack = &MakeHatAttack;
-    const MOVER: &dyn Mover = &HatMover;
-    const ATTACK_PATTERN: &[PatternStep] = &[
+    const MOVER: &dyn Mover = &HatDefaultMover;
+    const TOWARDS_ENEMY: &dyn Mover = &HatTowardsTargetMover;
+    const ATTACK_PATTERN: &[PatternStep; 16] = &[
         PatternStep::mover(MOVER),
+        PatternStep::nothing(),
         PatternStep::mover(MOVER),
+        PatternStep::nothing(),
+        PatternStep::nothing(),
+        PatternStep::nothing(),
+        PatternStep::mover(TOWARDS_ENEMY),
+        PatternStep::nothing(),
         PatternStep::mover(MOVER),
+        PatternStep::nothing(),
         PatternStep::mover(MOVER),
-        PatternStep::mover(MOVER),
-        PatternStep::mover(MOVER),
-        PatternStep::mover(MOVER),
+        PatternStep::nothing(),
+        PatternStep::nothing(),
+        PatternStep::nothing(),
         PatternStep {
             attack: Some(MAKE_ATTACK),
             mover: Some(MOVER),
         },
+        PatternStep::nothing(),
     ];
 
     let mut pattern = ATTACK_PATTERN.iter().cycle();
 
     for _ in 0..skip {
         pattern.next();
-        pattern.next();
     }
+
+    let dir = if skip % 1 == 0 { -1 } else { 1 };
+    let dir_x = (skip / 2) % 1 == 0;
 
     spawn_enemy(
         commands,
@@ -1085,11 +1357,15 @@ fn spawn_hat(
         asset_server.load("enemy.1.png"),
         PatternPlayer {
             state: Box::new(HatMoveState {
-                desired_dir: GridMovement { x: 1, y: 0 },
+                desired_dir: if dir_x {
+                    GridMovement { x: dir, y: 0 }
+                } else {
+                    GridMovement { x: 0, y: dir }
+                },
             }),
             sound: asset_server.load("hat-hit.wav"),
             pattern,
-            interval: BeatEvent::Eighth,
+            interval: BeatEvent::Sixteenth,
         },
     )
 }
@@ -1110,23 +1386,46 @@ fn spawn_snare(
     }
     struct SnareMoveState {
         desired_dir: GridMovement,
+        move_x: bool,
     }
 
     impl Mover for SnareMover {
         fn choose_move(
             &self,
             state: &mut dyn Any,
-            _target: Option<&GridPosition>,
+            target: Option<&GridPosition>,
             grid: &Grid,
             pos: &GridPosition,
         ) -> Option<GridMovement> {
             let state: &mut SnareMoveState = state.downcast_mut().unwrap();
 
-            if !grid.can_move(*pos, state.desired_dir) {
-                state.desired_dir = -state.desired_dir;
-            }
+            if let Some(target) = target {
+                let move_x = state.move_x;
+                state.move_x = !move_x;
+                if move_x {
+                    if target.x < pos.x {
+                        Some(GridMovement { x: -1, y: 0 })
+                    } else if target.x > pos.x {
+                        Some(GridMovement { x: 1, y: 0 })
+                    } else {
+                        None
+                    }
+                } else {
+                    if target.y < pos.y {
+                        Some(GridMovement { x: 0, y: -1 })
+                    } else if target.y > pos.y {
+                        Some(GridMovement { x: 0, y: 1 })
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                if !grid.can_move(*pos, state.desired_dir) {
+                    state.desired_dir = -state.desired_dir;
+                }
 
-            Some(state.desired_dir)
+                Some(state.desired_dir)
+            }
         }
     }
 
@@ -1207,7 +1506,10 @@ fn spawn_snare(
         asset_server.load("enemy.0.obj"),
         asset_server.load("enemy.0.png"),
         PatternPlayer {
-            state: Box::new(SnareMoveState { desired_dir: dir }),
+            state: Box::new(SnareMoveState {
+                desired_dir: dir,
+                move_x: skip % 1 == 0,
+            }),
             sound: asset_server.load("snare-hit.wav"),
             pattern,
             interval: BeatEvent::Quarter,
@@ -1269,15 +1571,74 @@ fn update_grid_elements(
     }
 }
 
+#[derive(Component)]
+struct HealthText;
+
 fn start_playing(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut timeline: ResMut<bevy_kira_audio::TimelineSettings>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut cur_beat: ResMut<BeatNumber>,
     asset_server: Res<AssetServer>,
     mut scene_spawner: ResMut<SceneSpawner>,
 ) {
     timeline.state = bevy_kira_audio::TimelineState::Playing;
+    *cur_beat = Default::default();
+
+    commands
+        .spawn_bundle(NodeBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                size: Size::new(Val::Percent(100.0), Val::Percent(100.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                ..Default::default()
+            },
+            color: Color::NONE.into(),
+            ..Default::default()
+        })
+        .insert(SceneRoot)
+        .with_children(|commands| {
+            commands
+                .spawn_bundle(TextBundle {
+                    style: Style {
+                        align_self: AlignSelf::FlexStart,
+                        position_type: PositionType::Absolute,
+                        position: Rect {
+                            left: Val::Px(20.0),
+                            top: Val::Px(20.0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    text: Text {
+                        sections: vec![
+                            TextSection {
+                                value: format!("Health: "),
+                                style: TextStyle {
+                                    font: asset_server.load("fonts/Gamer.ttf"),
+                                    font_size: 30.0,
+                                    color: Color::WHITE,
+                                },
+                            },
+                            TextSection {
+                                value: format!(""),
+                                style: TextStyle {
+                                    font: asset_server.load("fonts/Gamer.ttf"),
+                                    font_size: 30.0,
+                                    color: Color::RED,
+                                },
+                            },
+                        ],
+                        alignment: TextAlignment {
+                            horizontal: HorizontalAlign::Center,
+                            ..Default::default()
+                        },
+                    },
+                    ..Default::default()
+                })
+                .insert(HealthText);
+        });
 
     let root = commands
         .spawn()
@@ -1357,7 +1718,7 @@ fn start_playing(
         }
     }
 
-    let player = commands
+    commands
         .spawn_bundle(PbrBundle {
             mesh: asset_server.load("player.obj"),
             material: materials.add(StandardMaterial {
@@ -1369,56 +1730,31 @@ fn start_playing(
             ..Default::default()
         })
         .insert(Team::Player)
-        .insert(GridPosition::default())
+        .insert(GridPosition { x: 8, y: 6 })
         .insert(GridMovement::default())
         .insert(IsPlayer)
         .insert(Alive { alive: true })
-        .insert(Health { amount: 5 })
-        .insert(Parent(grid))
-        .id();
+        .insert(Health { amount: 3 })
+        .insert(Parent(grid));
+}
 
-    let snare = spawn_snare(
-        &mut commands,
-        &mut *materials,
-        &*asset_server,
-        0,
-        GridMovement { x: 0, y: -1 },
-    );
-    commands
-        .entity(snare)
-        .insert(Target(player))
-        .insert(Parent(grid.clone()))
-        .insert(GridPosition { x: 5, y: 10 });
-    let snare = spawn_snare(
-        &mut commands,
-        &mut *materials,
-        &*asset_server,
-        2,
-        GridMovement { x: 0, y: 1 },
-    );
-    commands
-        .entity(snare)
-        .insert(Target(player))
-        .insert(Parent(grid.clone()))
-        .insert(GridPosition { x: 10, y: 5 });
-
-    for i in 0..4 {
-        let hat = spawn_hat(&mut commands, &mut *materials, &*asset_server, i);
-        commands
-            .entity(hat)
-            .insert(Target(player))
-            .insert(Parent(grid.clone()))
-            .insert(GridPosition {
-                x: 2 + (i as u8 * 4),
-                y: 1 + (i as u8 * 3),
-            });
+fn update_health_text(
+    player: Query<&Health, With<IsPlayer>>,
+    mut text: Query<&mut Text, With<HealthText>>,
+) {
+    for (player, mut text) in player.iter().zip(text.iter_mut()) {
+        text.sections[1].value = format!("{}", player.amount);
     }
 }
 
-fn clear_stage<Filter: WorldQuery>(mut commands: Commands, roots: Query<Entity, Filter>)
-where
+fn clear_stage<Filter: WorldQuery>(
+    mut commands: Commands,
+    audio: Res<Audio>,
+    roots: Query<Entity, Filter>,
+) where
     Filter::Fetch: FilterFetch,
 {
+    audio.stop();
     for root in roots.iter() {
         commands.entity(root.clone()).despawn_recursive();
     }
