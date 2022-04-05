@@ -850,8 +850,9 @@ fn do_damage(
     for mut atk in attacks.iter_mut() {
         let attacker_team = attackers.get(atk.owner).unwrap();
         for (e, pos, mut health, mut alive, team, is_player) in entities.iter_mut() {
-            if *team != *attacker_team && atk.already_hit.insert(e) {
+            if *team != *attacker_team && !atk.already_hit.contains(&e) {
                 if let Some(atk_data) = atk.attack.hit(pos) {
+                    atk.already_hit.insert(e);
                     health.amount = health.amount.saturating_sub(atk_data.damage);
                     if health.amount == 0 {
                         alive.alive = false;
@@ -1025,7 +1026,7 @@ fn set_grid_attack_colors(
     attacks: Query<(&AttackComponent, &Parent)>,
 ) {
     for (_, mut element, _) in elements.iter_mut() {
-        element.color = DEFAULT_GRID_COLOR;
+        element.color = element.color + (DEFAULT_GRID_COLOR + (element.color * -1.)) * 0.05;
     }
 
     for (pos, mut element, el_parent) in elements.iter_mut() {
@@ -1442,7 +1443,7 @@ fn spawn_snare(
 
         fn update(&mut self, beat: &BeatEvent) -> bool {
             match beat {
-                BeatEvent::Quarter => false,
+                BeatEvent::QuarterTriplet => false,
                 _ => true,
             }
         }
